@@ -1,11 +1,3 @@
-"""
-tf.data.Dataset based dataloader for the BridgeData format, meaning
-TFRecords with one trajectory per example. See the BridgeDataset class
-below for more details.
-
-Written by Kevin Black (kvablack@berkeley.edu).
-"""
-
 import fnmatch
 from typing import Iterable, List, Optional, Union
 
@@ -36,55 +28,10 @@ def glob_to_path_list(
         path_list += filtered_paths
     return path_list
 
-
-@tf.function(jit_compile=True)
-def _binarize_gripper_actions(actions):
-    """Converts gripper actions from continous to binary values (0 and 1).
-
-    We exploit that fact that most of the time, the gripper is fully open (near
-    1.0) or fully closed (near 0.0). As it transitions between the two, it
-    sometimes passes through a few intermediate values. We relabel those
-    intermediate values based on the state that is reached _after_ those
-    intermediate values.
-
-    In the edge case that the trajectory ends with an intermediate value, we
-    give up on binarizing and relabel that chunk of intermediate values as
-    the last action in the trajectory.
-
-    The scan implements the following code:
-
-    new_actions = np.empty_like(actions)
-    carry = actions[-1]
-    for i in reversed(range(actions.shape[0])):
-        if in_between_mask[i]:
-            carry = carry
-        else:
-            carry = float(open_mask[i])
-        new_actions[i] = carry
-    """
-    open_mask = actions > 0.95
-    closed_mask = actions < 0.05
-    in_between_mask = tf.logical_not(tf.logical_or(open_mask, closed_mask))
-
-    is_open_float = tf.cast(open_mask, tf.float32)
-
-    def scan_fn(carry, i):
-        return tf.cond(
-            in_between_mask[i],
-            lambda: tf.cast(carry, tf.float32),
-            lambda: is_open_float[i],
-        )
-
-    new_actions = tf.scan(
-        scan_fn, tf.range(tf.shape(actions)[0]), actions[-1], reverse=True
-    )
-    return new_actions
-
-
-class BridgeDataset:
+class CalvinDataset:
     """
     Fast parallel tf.data.Dataset-based dataloader for a dataset in the
-    BridgeData format. This format consists of TFRecords where each example
+    Calvin dataset format. This format consists of TFRecords where each example
     is one trajectory. See `PROTO_TYPE_SPEC` below for the expected format
     for each example in more detail. See `_process_trajectory` below for
     the output format.
@@ -150,7 +97,7 @@ class BridgeDataset:
         skip_unlabeled: bool = False,
         **kwargs,
     ):
-        logging.warning("Extra kwargs passed to BridgeDataset: %s", kwargs)
+        logging.warning("Extra kwargs passed to CalvinDataset: %s", kwargs)
         if isinstance(data_paths[0], str):
             data_paths = [data_paths]
         if sample_weights is None:
@@ -173,7 +120,7 @@ class BridgeDataset:
         self.load_language = load_language
 
         if self.load_language:
-            self.PROTO_TYPE_SPEC["language"] = tf.string
+            self.PROTO_TYPE_SPEC["language_annotation"] = tf.string
 
         # construct a dataset for each sub-list of paths
         datasets = []
@@ -235,9 +182,7 @@ class BridgeDataset:
         dataset = dataset.map(self._decode_example, num_parallel_calls=tf.data.AUTOTUNE)
 
         # yields trajectories
-        dataset = dataset.map(
-            self._process_actions, num_parallel_calls=tf.data.AUTOTUNE
-        )
+        dataset = dataset.map(self._process_actions, num_parallel_calls=tf.data.AUTOTUNE)
 
         # yields trajectories
         dataset = dataset.map(self._chunk_act_obs, num_parallel_calls=tf.data.AUTOTUNE)
@@ -256,13 +201,9 @@ class BridgeDataset:
 
     # the expected type spec for the serialized examples
     PROTO_TYPE_SPEC = {
-        "observations/images0": tf.uint8,
-        "observations/state": tf.float32,
-        "next_observations/images0": tf.uint8,
-        "next_observations/state": tf.float32,
         "actions": tf.float32,
-        "terminals": tf.bool,
-        "truncates": tf.bool,
+        "proprioceptive_states": tf.float32,
+        "image_states": tf.uint8,
     }
 
     def _decode_example(self, example_proto):
@@ -272,44 +213,28 @@ class BridgeDataset:
             for key in self.PROTO_TYPE_SPEC.keys()
         }
         parsed_features = tf.io.parse_single_example(example_proto, features)
-        parsed_tensors = {
-            key: tf.io.parse_tensor(parsed_features[key], dtype)
-            for key, dtype in self.PROTO_TYPE_SPEC.items()
-        }
+        parsed_tensors = {}
+        for key, dtype in self.PROTO_TYPE_SPEC.items():
+            if dtype == tf.string:
+                parsed_tensors[key] = parsed_features[key]
+            else:
+                parsed_tensors[key] = tf.io.parse_tensor(parsed_features[key], dtype)
         # restructure the dictionary into the downstream format
         return {
             "observations": {
-                "image": parsed_tensors["observations/images0"],
-                "proprio": parsed_tensors["observations/state"],
+                "image": parsed_tensors["image_states"][:-1],
+                "proprio": parsed_tensors["proprioceptive_states"][:-1],
             },
             "next_observations": {
-                "image": parsed_tensors["next_observations/images0"],
-                "proprio": parsed_tensors["next_observations/state"],
+                "image": parsed_tensors["image_states"][1:],
+                "proprio": parsed_tensors["proprioceptive_states"][1:],
             },
-            **({"language": parsed_tensors["language"]} if self.load_language else {}),
-            "actions": parsed_tensors["actions"],
-            "terminals": parsed_tensors["terminals"],
-            "truncates": parsed_tensors["truncates"],
+            **({"language": parsed_tensors["language_annotation"]} if self.load_language else {}),
+            "actions": parsed_tensors["actions"][:-1],
+            "terminals": tf.zeros_like(parsed_tensors["actions"][:-1][:, 0:1], dtype=tf.bool)
         }
 
     def _process_actions(self, traj):
-        if self.relabel_actions:
-            # relabel the first 6 action dims (xyz position, xyz rotation)
-            # using the reached proprio
-            movement_actions = (
-                traj["next_observations"]["proprio"][:, :6]
-                - traj["observations"]["proprio"][:, :6]
-            )
-            # binarize the gripper action
-            continuous_gripper_actions = traj["actions"][:, 6]
-            binarized_gripper_actions = _binarize_gripper_actions(
-                continuous_gripper_actions
-            )
-
-            traj["actions"] = tf.concat(
-                [movement_actions, binarized_gripper_actions[:, None]], axis=1
-            )
-
         # normalize actions and proprio
         if self.action_proprio_metadata is not None:
             if self.normalization_type == "normal":
@@ -374,23 +299,70 @@ class BridgeDataset:
         return traj
 
     def _add_goals(self, traj):
+        if self.load_language:
+            lang = traj["language"]
+            traj["language"] = tf.broadcast_to(
+                lang, tf.shape(traj["terminals"])
+            )
+
         traj = GOAL_RELABELING_FUNCTIONS[self.goal_relabeling_strategy](
             traj, **self.goal_relabeling_kwargs
         )
 
         if self.load_language:
-            lang_idx = tf.random.uniform(
-                shape=[], maxval=len(traj["language"]), dtype=tf.int32
-            )
-            lang = traj["language"][lang_idx]
+            lang = traj["language"]
             traj["goals"]["language"] = tf.broadcast_to(
                 lang, tf.shape(traj["terminals"])
             )
             traj.pop("language")
 
+            # always make the "goal" the last obs so that masking is done
+            # properly below
+            traj_len = tf.shape(traj["goal_dists"])[0]
+            traj["goal_dists"] = traj_len - tf.range(traj_len)
+
         # after goal relabeling, we can set actions and obs to chunked version
         if "action_chunks" in traj:
             traj["actions"] = traj.pop("action_chunks")
+            # set movement actions to 0 after the goal is reached
+            new_movement = tf.where(
+                (
+                    traj["goal_dists"][:, None, None]
+                    > tf.range(self.act_pred_horizon)[None, :, None]
+                ),  # shape (traj_len, act_pred_horizon, 1)
+                traj["actions"][
+                    :, :, :-1
+                ],  # shape (traj_len, act_pred_horizon, action_dim - 1)
+                tf.zeros_like(traj["actions"][0, 0, :-1]),  # shape (action_dim - 1)
+            )
+            # for gripper actions, repeat the last action after the goal is reached
+            new_gripper = tf.where(
+                (
+                    traj["goal_dists"][:, None]
+                    > tf.range(self.act_pred_horizon)[None, :]
+                ),  # shape (traj_len, act_pred_horizon)
+                traj["actions"][:, :, -1],  # shape (traj_len, act_pred_horizon)
+                tf.gather(
+                    # shifts `actions` to the right by one, padding with the first action
+                    tf.concat(
+                        [
+                            tf.concat(
+                                [
+                                    traj["actions"][:1, :1, -1],
+                                    traj["actions"][:1, :-1, -1],
+                                ],
+                                axis=1,
+                            ),
+                            traj["actions"][:-1, :, -1],
+                        ],
+                        axis=0,
+                    ),
+                    # selects the action at index `goal_dists` in the previous action chunk
+                    tf.minimum(traj["goal_dists"], self.act_pred_horizon - 1),
+                    batch_dims=1,
+                )[:, None],
+            )
+            traj["actions"] = tf.concat([new_movement, new_gripper[:, :, None]], axis=2)
         if "obs_chunks" in traj:
             traj["observations"] = traj.pop("obs_chunks")
             traj["next_observations"] = traj.pop("next_obs_chunks")
