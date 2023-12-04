@@ -50,9 +50,9 @@ flags.DEFINE_string(
 flags.DEFINE_integer("num_timesteps", 120, "num timesteps")
 flags.DEFINE_bool("blocking", False, "Use the blocking controller")
 flags.DEFINE_spaceseplist(
-    "goal_eep", [0.3, 0.0, 0.15], "Goal position"
+    "goal_eep", [0.3, 0.0, 0.25], "Goal position"
 )  # not used by lc
-flags.DEFINE_spaceseplist("initial_eep", [0.3, 0.0, 0.15], "Initial position")
+flags.DEFINE_spaceseplist("initial_eep", [0.3, 0.0, 0.25], "Initial position")
 flags.DEFINE_integer("act_exec_horizon", 1, "Action sequence length")
 flags.DEFINE_bool("deterministic", True, "Whether to sample action deterministically")
 flags.DEFINE_string("ip", "localhost", "IP address of the robot")
@@ -68,7 +68,8 @@ NO_PITCH_ROLL = False
 NO_YAW = False
 STICKY_GRIPPER_NUM_STEPS = 1
 WORKSPACE_BOUNDS = [[0.1, -0.15, -0.01, -1.57, 0], [0.45, 0.25, 0.25, 1.57, 0]]
-CAMERA_TOPICS = [{"name": "/blue/image_raw"}]
+# CAMERA_TOPICS = [{"name": "/blue/image_raw"}]
+CAMERA_TOPICS = [{"name": "/camera0/image_raw"}]
 FIXED_STD = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
 ENV_PARAMS = {
     "camera_topics": CAMERA_TOPICS,
@@ -178,7 +179,6 @@ def request_goal_image(image_goal, widowx_client):
             print("WARNING retrying to get observation...")
             obs = widowx_client.get_observation()
             time.sleep(1)
-
         image_goal = (
             obs["image"].reshape(3, FLAGS.im_size, FLAGS.im_size).transpose(1, 2, 0)
             * 255
@@ -287,8 +287,8 @@ def main(_):
 
             # retry move action until success
             move_status = None
-            while move_status != WidowXStatus.SUCCESS:
-                move_status = widowx_client.move(eep, duration=1.5)
+            # while move_status != WidowXStatus.SUCCESS:
+            move_status = widowx_client.move(eep, duration=1.5, blocking=True)
 
         # do rollout
         last_tstep = time.time()
@@ -357,6 +357,9 @@ def main(_):
                             action[4] = 0
                         if NO_YAW:
                             action[5] = 0
+
+                        print('t:', t)
+                        print('action:', action)
 
                         # perform environment step
                         widowx_client.step_action(action, blocking=FLAGS.blocking)
